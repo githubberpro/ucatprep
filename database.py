@@ -26,6 +26,7 @@ DB_PATH = Path(__file__).parent / "ucat.db"
 _USE_PG: bool | None = None
 _DB_URL: str = ""
 _BOOTSTRAPPED: bool = False
+_CONN = None  # cached Postgres connection, reused for the life of the process
 
 
 def _setup() -> bool:
@@ -40,17 +41,56 @@ def _ph() -> str:
     return "%s" if _setup() else "?"
 
 
+def _connect_pg():
+    # Neon (and most cloud PostgreSQL) requires SSL — add sslmode=require if absent
+    url = _DB_URL
+    if "sslmode" not in url:
+        url += ("&" if "?" in url else "?") + "sslmode=require"
+    conn = psycopg2.connect(url, cursor_factory=psycopg2.extras.RealDictCursor)
+    # Single long-lived connection: autocommit avoids a failed statement leaving
+    # the connection in an aborted-transaction state that poisons later queries.
+    conn.autocommit = True
+    return conn
+
+
 def get_conn():
+    """Return a database connection.
+
+    For Postgres/Neon the connection is cached and reused for the life of the
+    process — opening a fresh SSL connection on every query was the main source
+    of per-interaction latency. A closed/dropped connection is reopened on the
+    next call. SQLite is a local file and cheap to open, so it stays per-call.
+    """
+    global _CONN
     if _setup():
-        # Neon (and most cloud PostgreSQL) requires SSL — add sslmode=require if absent
-        url = _DB_URL
-        if "sslmode" not in url:
-            url += ("&" if "?" in url else "?") + "sslmode=require"
-        return psycopg2.connect(url, cursor_factory=psycopg2.extras.RealDictCursor)
+        if _CONN is None or getattr(_CONN, "closed", 1):
+            _CONN = _connect_pg()
+        return _CONN
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+def _drop_conn():
+    """Discard the cached Postgres connection so the next call reconnects."""
+    global _CONN
+    if _CONN is not None:
+        try:
+            _CONN.close()
+        except Exception:
+            pass
+        _CONN = None
+
+
+def _pg_call(run):
+    """Run ``run(conn)`` on the cached Postgres connection, reconnecting and
+    retrying once if it has been dropped (e.g. a Neon idle timeout)."""
+    try:
+        return run(get_conn())
+    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+        _drop_conn()
+        return run(get_conn())
 
 
 def _n(sql: str) -> str:
@@ -63,19 +103,23 @@ def _n(sql: str) -> str:
 def _q(conn, sql: str, params=()):
     """Execute and return all rows as dicts."""
     if _setup():
-        with conn.cursor() as cur:
-            cur.execute(sql, params or None)
-            return [dict(r) for r in cur.fetchall()]
+        def run(c):
+            with c.cursor() as cur:
+                cur.execute(sql, params or None)
+                return [dict(r) for r in cur.fetchall()]
+        return _pg_call(run)
     return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
 
 def _q1(conn, sql: str, params=()):
     """Execute and return first row as dict, or None."""
     if _setup():
-        with conn.cursor() as cur:
-            cur.execute(sql, params or None)
-            row = cur.fetchone()
-            return dict(row) if row else None
+        def run(c):
+            with c.cursor() as cur:
+                cur.execute(sql, params or None)
+                row = cur.fetchone()
+                return dict(row) if row else None
+        return _pg_call(run)
     row = conn.execute(sql, params).fetchone()
     return dict(row) if row else None
 
@@ -85,22 +129,30 @@ def _run(conn, sql: str, params=()):
     if _setup():
         is_insert = sql.strip().upper().startswith("INSERT") and "RETURNING" not in sql.upper()
         exec_sql = (sql.rstrip(";") + " RETURNING id") if is_insert else sql
-        with conn.cursor() as cur:
-            cur.execute(exec_sql, params or None)
-            if is_insert:
-                row = cur.fetchone()
-                return row["id"] if row else None
-        return None
+        def run(c):
+            with c.cursor() as cur:
+                cur.execute(exec_sql, params or None)
+                if is_insert:
+                    row = cur.fetchone()
+                    return row["id"] if row else None
+            return None
+        return _pg_call(run)
     cur = conn.execute(sql, params)
     return cur.lastrowid
 
 
 def _commit(conn):
-    conn.commit()
+    # Postgres runs in autocommit mode (see _connect_pg); commit() is a harmless
+    # no-op there. SQLite still needs an explicit commit.
+    if not _setup():
+        conn.commit()
 
 
 def _close(conn):
-    conn.close()
+    # The Postgres connection is cached and reused, so closing it here would
+    # defeat the purpose. SQLite connections are per-call and must be closed.
+    if not _setup():
+        conn.close()
 
 
 # ── Schema ─────────────────────────────────────────────────────────────────────
