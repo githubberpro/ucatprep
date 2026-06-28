@@ -57,13 +57,14 @@ def _check_password() -> bool:
         return True
     if st.session_state.get("_authenticated"):
         return True
-    st.markdown("""
-    <div style='max-width:380px;margin:80px auto 0;text-align:center'>
-        <div style='font-size:3rem;margin-bottom:8px'>🩺</div>
-        <h2 style='margin-bottom:4px'>UCAT Prep</h2>
-        <p style='color:#888;margin-bottom:28px;font-size:14px'>Sign in to start studying</p>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        "<div style='max-width:380px;margin:80px auto 0;text-align:center'>"
+        "<div style='font-size:3rem;margin-bottom:8px'>🩺</div>"
+        "<h2 style='margin-bottom:4px'>UCAT Prep</h2>"
+        "<p style='color:#888;margin-bottom:28px;font-size:14px'>Sign in to start studying</p>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
     col = st.columns([1, 2, 1])[1]
     with col:
         pw = st.text_input("Password", type="password", placeholder="Enter password", label_visibility="collapsed")
